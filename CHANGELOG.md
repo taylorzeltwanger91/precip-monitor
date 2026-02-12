@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-02-11
+
+### Added
+- Full weather data logging to Firestore `observations` collection (temperature, humidity, dew point, wind speed, wind direction, precipitation)
+- Weather detail cards in site detail view showing all 6 parameters
+- Unit conversions: Celsius to Fahrenheit, km/h to mph, degrees to compass labels
+
+### Changed
+- Refresh cycle from 15 minutes to 1 hour
+- Open-Meteo query expanded from precipitation-only to all weather parameters
+
 ## [1.0.0] - 2026-02-11
 
 ### Added
