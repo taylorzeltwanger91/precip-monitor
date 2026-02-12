@@ -498,7 +498,7 @@ export default function App() {
     else if (sort === 'precip') list.sort((a, b) => (weatherData[b.id]?.precip24hr ?? -1) - (weatherData[a.id]?.precip24hr ?? -1))
     else if (sort === 'state') list.sort((a, b) => a.state.localeCompare(b.state) || a.name.localeCompare(b.name))
     return list
-  }, [sites, filter, sort, precipData])
+  }, [sites, filter, sort, weatherData])
 
   const precipSiteCount = sites.filter(s => (weatherData[s.id]?.precip24hr ?? 0) > 0).length
 
