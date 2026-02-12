@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { initializeApp } from 'firebase/app'
-import { getFirestore, collection, getDocs, addDoc, updateDoc, deleteDoc, doc } from 'firebase/firestore'
+import { getFirestore, collection, getDocs, addDoc, updateDoc, deleteDoc, doc, Timestamp } from 'firebase/firestore'
 import { MapContainer, TileLayer, Marker, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
@@ -33,7 +33,7 @@ const db = getFirestore(app)
 
 // ── Constants ──
 const MM_TO_INCHES = 0.0393701
-const REFRESH_INTERVAL = 15 * 60 * 1000 // 15 minutes
+const REFRESH_INTERVAL = 60 * 60 * 1000 // 1 hour
 const FETCH_DELAY = 100 // ms between API calls
 const PRECIP_THRESHOLDS = { light: 0, moderate: 0.25, heavy: 0.5 }
 
@@ -71,14 +71,40 @@ async function deleteSiteDoc(id) {
 }
 
 // ── Weather fetch ──
-async function fetchPrecipitation(lat, lon) {
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation&timezone=America/Chicago&past_hours=24&forecast_hours=0`
+const WEATHER_PARAMS = 'precipitation,temperature_2m,relative_humidity_2m,dew_point_2m,wind_speed_10m,wind_direction_10m'
+
+function celsiusToFahrenheit(c) { return c != null ? Math.round((c * 9 / 5 + 32) * 10) / 10 : null }
+function kphToMph(k) { return k != null ? Math.round(k * 0.621371 * 10) / 10 : null }
+function lastVal(arr) { return arr && arr.length > 0 ? arr[arr.length - 1] : null }
+
+async function fetchWeatherData(lat, lon) {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=${WEATHER_PARAMS}&timezone=America/Chicago&past_hours=24&forecast_hours=0`
   const res = await fetch(url)
   if (!res.ok) throw new Error(`Weather API error: ${res.status}`)
   const data = await res.json()
-  const hourlyPrecip = data.hourly?.precipitation || []
-  const totalMm = hourlyPrecip.reduce((sum, v) => sum + (v || 0), 0)
-  return Math.round(totalMm * MM_TO_INCHES * 100) / 100
+  const h = data.hourly || {}
+  const precipMm = (h.precipitation || []).reduce((sum, v) => sum + (v || 0), 0)
+  return {
+    precip24hr: Math.round(precipMm * MM_TO_INCHES * 100) / 100,
+    tempF: celsiusToFahrenheit(lastVal(h.temperature_2m)),
+    humidity: lastVal(h.relative_humidity_2m),
+    dewPointF: celsiusToFahrenheit(lastVal(h.dew_point_2m)),
+    windSpeedMph: kphToMph(lastVal(h.wind_speed_10m)),
+    windDir: lastVal(h.wind_direction_10m),
+  }
+}
+
+// ── Observation logging ──
+async function logObservation(siteId, weather) {
+  try {
+    await addDoc(collection(db, 'observations'), {
+      siteId,
+      ...weather,
+      timestamp: Timestamp.now(),
+    })
+  } catch (e) {
+    console.error(`Failed to log observation for ${siteId}:`, e)
+  }
 }
 
 function delay(ms) {
@@ -127,7 +153,7 @@ function useSites() {
 }
 
 function useWeatherData(sites) {
-  const [precipData, setPrecipData] = useState({})
+  const [weatherData, setWeatherData] = useState({})
   const [fetching, setFetching] = useState(false)
   const [lastUpdated, setLastUpdated] = useState(null)
   const intervalRef = useRef(null)
@@ -139,14 +165,16 @@ function useWeatherData(sites) {
     for (let i = 0; i < sitesToFetch.length; i++) {
       const site = sitesToFetch[i]
       try {
-        results[site.id] = await fetchPrecipitation(site.lat, site.lon)
+        const weather = await fetchWeatherData(site.lat, site.lon)
+        results[site.id] = weather
+        await logObservation(site.id, weather)
       } catch (e) {
         console.error(`Failed to fetch weather for ${site.name}:`, e)
         results[site.id] = null
       }
       if (i < sitesToFetch.length - 1) await delay(FETCH_DELAY)
     }
-    setPrecipData(prev => ({ ...prev, ...results }))
+    setWeatherData(prev => ({ ...prev, ...results }))
     setLastUpdated(new Date())
     setFetching(false)
   }, [])
@@ -163,7 +191,7 @@ function useWeatherData(sites) {
 
   const refresh = useCallback(() => fetchAll(sites), [sites, fetchAll])
 
-  return { precipData, fetching, lastUpdated, refresh }
+  return { weatherData, fetching, lastUpdated, refresh }
 }
 
 // ── Components ──
@@ -175,7 +203,8 @@ function MapUpdater({ center, zoom }) {
   return null
 }
 
-function SiteRow({ site, precip, onClick, index }) {
+function SiteRow({ site, weather, onClick, index }) {
+  const precip = weather?.precip24hr ?? null
   const cls = precip != null ? getPrecipClass(precip) : ''
   const color = getPrecipColor(cls)
   const barWidth = precip > 0 ? Math.min((precip / 1.0) * 100, 100) : 0
@@ -313,8 +342,26 @@ function SiteForm({ initial, onSave, onCancel }) {
   )
 }
 
-function SiteDetail({ site, precip, onBack, onEdit, onDelete }) {
+function windDirLabel(deg) {
+  if (deg == null) return '---'
+  const dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+  return dirs[Math.round(deg / 22.5) % 16]
+}
+
+function WeatherCard({ label, value, unit }) {
+  return (
+    <div style={{ background: '#0f172a', borderRadius: '8px', padding: '12px' }}>
+      <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{label}</div>
+      <div style={{ fontSize: '14px', color: '#e2e8f0', fontVariantNumeric: 'tabular-nums' }}>
+        {value ?? '---'}{value != null && unit ? <span style={{ fontSize: '10px', opacity: 0.6 }}> {unit}</span> : null}
+      </div>
+    </div>
+  )
+}
+
+function SiteDetail({ site, weather, onBack, onEdit, onDelete }) {
   const [confirming, setConfirming] = useState(false)
+  const precip = weather?.precip24hr ?? null
   const cls = precip != null ? getPrecipClass(precip) : ''
   const color = getPrecipColor(cls)
 
@@ -376,16 +423,12 @@ function SiteDetail({ site, precip, onBack, onEdit, onDelete }) {
           </div>
         )}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '4px' }}>
-          <div style={{ background: '#0f172a', borderRadius: '8px', padding: '12px' }}>
-            <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.08em' }}>State</div>
-            <div style={{ fontSize: '14px', color: '#e2e8f0' }}>{site.state}</div>
-          </div>
-          <div style={{ background: '#0f172a', borderRadius: '8px', padding: '12px' }}>
-            <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Coordinates</div>
-            <div style={{ fontSize: '12px', color: '#e2e8f0', fontVariantNumeric: 'tabular-nums' }}>
-              {site.lat.toFixed(3)}, {site.lon.toFixed(3)}
-            </div>
-          </div>
+          <WeatherCard label="Temperature" value={weather?.tempF} unit="°F" />
+          <WeatherCard label="Humidity" value={weather?.humidity != null ? Math.round(weather.humidity) : null} unit="%" />
+          <WeatherCard label="Dew Point" value={weather?.dewPointF} unit="°F" />
+          <WeatherCard label="Wind Speed" value={weather?.windSpeedMph} unit="mph" />
+          <WeatherCard label="Wind Direction" value={weather?.windDir != null ? `${windDirLabel(weather.windDir)} (${Math.round(weather.windDir)}°)` : null} unit="" />
+          <WeatherCard label="Coordinates" value={`${site.lat.toFixed(3)}, ${site.lon.toFixed(3)}`} unit="" />
         </div>
       </div>
     </div>
@@ -434,7 +477,7 @@ const CSS = `
 // ── App ──
 export default function App() {
   const { sites, loading, error, reload, add, update, remove } = useSites()
-  const { precipData, fetching, lastUpdated, refresh } = useWeatherData(sites)
+  const { weatherData, fetching, lastUpdated, refresh } = useWeatherData(sites)
 
   const [view, setView] = useState('list')
   const [selectedId, setSelectedId] = useState(null)
@@ -452,12 +495,12 @@ export default function App() {
     let list = [...sites]
     if (filter !== 'all') list = list.filter(s => s.state === filter)
     if (sort === 'name') list.sort((a, b) => a.name.localeCompare(b.name))
-    else if (sort === 'precip') list.sort((a, b) => (precipData[b.id] ?? -1) - (precipData[a.id] ?? -1))
+    else if (sort === 'precip') list.sort((a, b) => (weatherData[b.id]?.precip24hr ?? -1) - (weatherData[a.id]?.precip24hr ?? -1))
     else if (sort === 'state') list.sort((a, b) => a.state.localeCompare(b.state) || a.name.localeCompare(b.name))
     return list
   }, [sites, filter, sort, precipData])
 
-  const precipSiteCount = sites.filter(s => (precipData[s.id] ?? 0) > 0).length
+  const precipSiteCount = sites.filter(s => (weatherData[s.id]?.precip24hr ?? 0) > 0).length
 
   const handleAdd = async (data) => {
     await add(data)
@@ -584,7 +627,7 @@ export default function App() {
                   <SiteRow
                     key={site.id}
                     site={site}
-                    precip={precipData[site.id] ?? null}
+                    weather={weatherData[site.id] ?? null}
                     index={i}
                     onClick={() => { setSelectedId(site.id); setView('detail') }}
                   />
@@ -606,7 +649,7 @@ export default function App() {
         {view === 'detail' && selectedSite && (
           <SiteDetail
             site={selectedSite}
-            precip={precipData[selectedSite.id] ?? null}
+            weather={weatherData[selectedSite.id] ?? null}
             onBack={() => setView('list')}
             onEdit={() => setView('edit')}
             onDelete={handleDelete}
